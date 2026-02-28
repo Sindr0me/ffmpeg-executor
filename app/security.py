@@ -57,3 +57,66 @@ def validate_input_url(url: str) -> str:
                 )
 
     return url
+
+# ── Raw FFmpeg command security ───────────────────────────────────────────────
+
+import re as _re
+
+# Patterns that are blocked in raw ffmpeg commands
+_BLOCKED_CMD_PATTERNS = [
+    # Direct network access (all inputs must go through input_files)
+    r'https?://',
+    r'rtsp://',
+    r'rtmp://',
+    r'ftp://',
+    r'tcp://',
+    r'udp://',
+    # Filesystem escapes
+    r'/etc/',
+    r'/proc/',
+    r'/sys/',
+    r'/root/',
+    r'/home/',
+    r'/var/',
+    r'/tmp/',
+    r'\.\.',   # path traversal
+    # Dangerous lavfi/filter features
+    r'script=',
+    r'aeval=.*exec',
+    # Shell injection via pipe
+    r'pipe:.*\|',
+    r'\$\(',   # command substitution
+    r'`',      # backtick execution
+]
+
+_BLOCKED_CMD_RE = _re.compile('|'.join(_BLOCKED_CMD_PATTERNS), _re.IGNORECASE)
+
+PLACEHOLDER_RE = _re.compile(r'\{\{(in_\w+|out_\w+)\}\}')
+
+
+class CommandSecurityError(ValueError):
+    pass
+
+
+def validate_ffmpeg_command(cmd: str, input_aliases: set[str], output_aliases: set[str]) -> None:
+    """Validate a raw ffmpeg command string for security issues."""
+    if _BLOCKED_CMD_RE.search(cmd):
+        match = _BLOCKED_CMD_RE.search(cmd)
+        raise CommandSecurityError(f"Blocked pattern in ffmpeg_command: '{match.group()}'")
+
+    # Check all placeholders reference declared aliases
+    found = set(PLACEHOLDER_RE.findall(cmd))
+    all_aliases = input_aliases | output_aliases
+    unknown = found - all_aliases
+    if unknown:
+        raise CommandSecurityError(
+            f"Unknown placeholders in ffmpeg_command: {unknown}. "
+            f"Declared: {all_aliases}"
+        )
+
+    # Check all declared aliases are used
+    missing = all_aliases - found
+    if missing:
+        raise CommandSecurityError(
+            f"Declared aliases not used in ffmpeg_command: {missing}"
+        )

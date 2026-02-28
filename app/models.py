@@ -50,3 +50,32 @@ class Job(Base):
         if self.started_at and self.finished_at:
             return (self.finished_at - self.started_at).total_seconds()
         return None
+
+
+# ── Command (Rendi-style raw FFmpeg) ──────────────────────────────────────────
+
+class Command(Base):
+    __tablename__ = "commands"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status = Column(Enum(JobStatus), nullable=False, default=JobStatus.QUEUED)
+    stage = Column(String(64), default="QUEUED")
+
+    ffmpeg_command = Column(Text, nullable=False)
+    input_files = Column(JSON, default=dict)       # {alias: url}
+    output_files_spec = Column(JSON, default=dict)  # {alias: filename}
+    output_files_result = Column(JSON, default=dict) # {alias: {url, size_bytes}}
+
+    webhook_url = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    ffmpeg_stderr = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.started_at and self.finished_at:
+            return (self.finished_at - self.started_at).total_seconds()
+        return None

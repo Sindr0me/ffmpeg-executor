@@ -1,6 +1,9 @@
 # FFmpeg Executor API
 
-Internal HTTP service for async video processing. Accepts jobs from n8n (or any HTTP client), runs FFmpeg, uploads results to Cloudflare R2, returns a public URL.
+Internal HTTP service for async video processing. Two modes:
+
+- **Preset API** (`/jobs`) — ready-made presets for common tasks (thumbnail, transcode, etc.)
+- **Command API** (`/v1/commands`) — raw FFmpeg commands, Rendi-compatible
 
 **Base URL:** `https://ffmpeg-api.kuprino.com`
 
@@ -9,401 +12,407 @@ Internal HTTP service for async video processing. Accepts jobs from n8n (or any 
 ## Architecture
 
 ```
-n8n / caller
-    │
-    │  POST /jobs
-    ▼
-FastAPI (api)
-    │  enqueue
-    ▼
-Celery Worker ──► FFmpeg ──► Cloudflare R2
-    │
-    │  webhook (optional)
-    ▼
-caller
+caller (n8n / Claude / curl)
+        │
+        ├─ POST /v1/commands  ──► raw FFmpeg command
+        └─ POST /jobs         ──► preset
+                │
+           FastAPI (api)
+                │  enqueue Celery task
+                ▼
+          Celery Worker
+                │
+         ┌──────┴──────┐
+     download        FFmpeg
+     (SSRF check)    subprocess
+                         │
+                         ▼
+                  Cloudflare R2
+                  (public URL)
+                         │
+                    webhook (opt)
 ```
 
-- **API** — FastAPI, accepts jobs, returns `job_id` immediately (async)
-- **Worker** — Celery + Redis, downloads input, runs FFmpeg, uploads result
-- **Storage** — Cloudflare R2, results accessible via public URL
-- **DB** — PostgreSQL, stores job metadata and status
+- **API** — FastAPI, responds immediately with `command_id` / `job_id`
+- **Worker** — Celery + Redis, executes the pipeline asynchronously
+- **Storage** — Cloudflare R2, results accessible via `pub-*.r2.dev` public URL
+- **DB** — PostgreSQL, persists all job/command state
 
 ---
 
-## API Reference
+## Command API — raw FFmpeg (Rendi-compatible)
 
-### POST /jobs — Submit a job
+Full FFmpeg expressivity: pass any FFmpeg arguments as a string.  
+Input and output files are referenced via `{{alias}}` placeholders.
 
-**Request body (JSON):**
+### POST /v1/commands
+
+**Request:**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `preset` | string | ✅ | Preset name (see list below) |
-| `input_url` | string | ✅ | HTTPS URL of the source video/audio |
-| `output_filename` | string | ✅ | Name for the output file (e.g. `result.mp4`) |
-| `preset_options` | object | — | Preset-specific parameters (see per-preset docs) |
-| `webhook_url` | string | — | HTTPS URL to POST the result to on completion |
-| `metadata` | object | — | Arbitrary key-value data, stored with the job |
+| `ffmpeg_command` | string | ✅ | FFmpeg arguments (no `ffmpeg` word). Use `{{in_alias}}` and `{{out_alias}}` for files |
+| `input_files` | object | ✅ | `{ "in_alias": "https://..." }` — aliases **must** start with `in_` |
+| `output_files` | object | ✅ | `{ "out_alias": "filename.ext" }` — aliases **must** start with `out_` |
+| `webhook_url` | string | — | HTTPS URL to POST result to on completion |
 
-**Response `202 Accepted`:**
+**Response `202`:**
 ```json
-{
-  "job_id": "98906deb-9a70-46a6-bf2e-c979d470cb37"
-}
+{ "command_id": "9bc09dc6-cf96-433f-885b-7e1e63350fac" }
 ```
 
-**Example:**
+**Example — extract thumbnail:**
 ```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+curl -X POST https://ffmpeg-api.kuprino.com/v1/commands \
   -H "Content-Type: application/json" \
   -d '{
-    "preset": "thumbnail_jpg",
-    "input_url": "https://example.com/video.mp4",
-    "output_filename": "thumb.jpg"
+    "ffmpeg_command": "-i {{in_video}} -ss 5 -frames:v 1 -q:v 2 {{out_thumb}}",
+    "input_files": {
+      "in_video": "https://example.com/video.mp4"
+    },
+    "output_files": {
+      "out_thumb": "thumb.jpg"
+    }
   }'
 ```
 
----
+**Example — transcode to 720p with custom settings:**
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/v1/commands \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ffmpeg_command": "-i {{in_src}} -vf scale=1280:720 -c:v libx264 -crf 20 -preset fast -c:a aac -b:a 192k -movflags +faststart {{out_720p}}",
+    "input_files": { "in_src": "https://example.com/4k.mp4" },
+    "output_files": { "out_720p": "720p.mp4" }
+  }'
+```
 
-### GET /jobs/{job_id} — Get job status
+**Example — extract audio:**
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/v1/commands \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ffmpeg_command": "-i {{in_video}} -vn -c:a libmp3lame -b:a 128k {{out_audio}}",
+    "input_files": { "in_video": "https://example.com/video.mp4" },
+    "output_files": { "out_audio": "audio.mp3" }
+  }'
+```
+
+**Example — multiple outputs (thumbnail + 720p in one run):**
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/v1/commands \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ffmpeg_command": "-i {{in_src}} -ss 3 -frames:v 1 {{out_thumb}} -vf scale=1280:720 -c:v libx264 -crf 23 {{out_video}}",
+    "input_files": { "in_src": "https://example.com/video.mp4" },
+    "output_files": {
+      "out_thumb": "preview.jpg",
+      "out_video": "720p.mp4"
+    }
+  }'
+```
+
+**Example — overlay watermark:**
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/v1/commands \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ffmpeg_command": "-i {{in_video}} -i {{in_logo}} -filter_complex overlay=W-w-10:H-h-10 -c:v libx264 -crf 23 {{out_result}}",
+    "input_files": {
+      "in_video": "https://example.com/video.mp4",
+      "in_logo": "https://example.com/logo.png"
+    },
+    "output_files": { "out_result": "watermarked.mp4" }
+  }'
+```
+
+### GET /v1/commands/{command_id}
 
 **Response:**
 
 | Field | Type | Description |
 |---|---|---|
-| `job_id` | UUID | Job identifier |
+| `command_id` | UUID | |
 | `status` | string | `QUEUED` / `DOWNLOADING` / `PROCESSING` / `UPLOADING` / `SUCCESS` / `FAILED` |
-| `stage` | string | Current stage detail |
-| `preset` | string | Preset used |
-| `output_url` | string \| null | Public URL of the result (set on SUCCESS) |
-| `created_at` | datetime | ISO 8601 |
-| `started_at` | datetime \| null | When worker picked up the job |
-| `finished_at` | datetime \| null | When job completed or failed |
-| `duration_seconds` | float \| null | Total processing time |
-| `error` | string \| null | Error message (set on FAILED) |
+| `ffmpeg_command` | string | Original command |
+| `input_files` | object | Input aliases → URLs |
+| `output_files` | object | Output aliases → `{ url, size_bytes }` |
+| `created_at` | datetime | |
+| `started_at` | datetime \| null | |
+| `finished_at` | datetime \| null | |
+| `duration_seconds` | float \| null | |
+| `error` | string \| null | Set on FAILED |
 
-**Example:**
-```bash
-curl https://ffmpeg-api.kuprino.com/jobs/98906deb-9a70-46a6-bf2e-c979d470cb37
-```
-
+**Example response (SUCCESS):**
 ```json
 {
-  "job_id": "98906deb-9a70-46a6-bf2e-c979d470cb37",
+  "command_id": "9bc09dc6-cf96-433f-885b-7e1e63350fac",
   "status": "SUCCESS",
   "stage": "DONE",
-  "preset": "thumbnail_jpg",
-  "output_url": "https://pub-9211a70aab784d6bb4f9bfdbee2871c1.r2.dev/ffmpeg-results/98906deb-.../thumb.jpg",
-  "created_at": "2026-02-28T19:35:03.850171Z",
-  "started_at": "2026-02-28T19:35:03.863550Z",
-  "finished_at": "2026-02-28T19:35:05.254764Z",
-  "duration_seconds": 1.39,
+  "ffmpeg_command": "-i {{in_video}} -ss 2 -frames:v 1 -q:v 3 {{out_thumb}}",
+  "input_files": { "in_video": "https://example.com/video.mp4" },
+  "output_files": {
+    "out_thumb": {
+      "url": "https://pub-9211a70aab784d6bb4f9bfdbee2871c1.r2.dev/ffmpeg-results/9bc09dc6-.../thumb.jpg",
+      "size_bytes": 42547
+    }
+  },
+  "duration_seconds": 0.64,
   "error": null
 }
 ```
 
+```bash
+curl https://ffmpeg-api.kuprino.com/v1/commands/9bc09dc6-cf96-433f-885b-7e1e63350fac
+```
+
+### Security rules for ffmpeg_command
+
+The command string is validated before execution. **Blocked patterns:**
+
+| Pattern | Reason |
+|---|---|
+| `https://`, `http://`, `tcp://`, `rtsp://` etc. | All inputs must go through `input_files` |
+| `/etc/`, `/proc/`, `/sys/`, `/home/`, `..` | Filesystem escape prevention |
+| `script=` in filters | Arbitrary code execution |
+| `` ` ``, `$(` | Shell injection |
+| `pipe:\|...` | Command piping |
+
+Flags `-nostdin -protocol_whitelist file,pipe` are prepended automatically to every command.
+
 ---
 
-### GET /health — Health check
+## Preset API
+
+Ready-made presets for common tasks. Simpler to use than raw commands.
+
+### POST /jobs
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `preset` | string | ✅ | Preset name |
+| `input_url` | string | ✅ | HTTPS URL of the source file |
+| `output_filename` | string | ✅ | Output filename |
+| `preset_options` | object | — | Preset-specific parameters |
+| `webhook_url` | string | — | HTTPS callback URL |
+| `metadata` | object | — | Arbitrary key-value data stored with the job |
+
+**Response `202`:**
+```json
+{ "job_id": "98906deb-9a70-46a6-bf2e-c979d470cb37" }
+```
+
+### GET /jobs/{job_id}
+
+Same structure as `/v1/commands/{id}`, but with single `output_url` (string) instead of `output_files` dict.
+
+---
+
+## Available Presets
+
+### `transcode_h264_mp4`
+Convert any video to H.264 + AAC, MP4 container.
+
+| Option | Default | Description |
+|---|---|---|
+| `crf` | `23` | Quality (0=lossless → 51=worst) |
+| `audio_bitrate` | `"128k"` | Audio bitrate |
 
 ```bash
-curl https://ffmpeg-api.kuprino.com/health
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"transcode_h264_mp4","input_url":"https://example.com/video.avi","output_filename":"out.mp4","preset_options":{"crf":20}}'
 ```
 
-```json
-{
-  "status": "ok",
-  "api": true,
-  "redis": true,
-  "postgres": true
-}
-```
+### `scale_fit_max`
+Scale down to fit within max dimensions (never upscales), preserve aspect ratio.
 
-`status` is `"ok"` when all components are healthy, `"degraded"` otherwise.
+| Option | Default | Description |
+|---|---|---|
+| `max_width` | `1920` | Max width px |
+| `max_height` | `1080` | Max height px |
+| `crf` | `23` | Quality |
+
+### `thumbnail_jpg`
+Extract a single frame as JPEG.
+
+| Option | Default | Description |
+|---|---|---|
+| `at_seconds` | `1.0` | Timestamp to grab frame |
+| `quality` | `5` | JPEG quality (1=best, 31=worst) |
+
+### `burn_subs`
+Burn SRT/ASS subtitles permanently into video.
+
+| Option | Default | Description |
+|---|---|---|
+| `input_subs_url` | — | ⚠️ Required. URL of `.srt` or `.ass` file |
+| `crf` | `23` | Quality |
+
+### `overlay_image`
+Overlay PNG/JPG watermark at a given position.
+
+| Option | Default | Description |
+|---|---|---|
+| `input_overlay_url` | — | ⚠️ Required. URL of overlay image |
+| `x` | `10` | X offset px |
+| `y` | `10` | Y offset px |
+| `crf` | `23` | Quality |
+
+### `extract_audio_mp3`
+Extract audio track as MP3.
+
+| Option | Default | Description |
+|---|---|---|
+| `audio_bitrate` | `"128k"` | Bitrate |
+
+### `concat_videos`
+Concatenate videos via stream copy (same codec/resolution required).
+
+| Option | Default | Description |
+|---|---|---|
+| `input_urls` | — | ⚠️ Required. Array of additional video URLs (in order after `input_url`) |
+
+### `hls_package`
+Package video as HLS playlist + segments, output as `.zip`.
+
+| Option | Default | Description |
+|---|---|---|
+| `hls_time` | `6` | Segment duration (seconds) |
+| `video_bitrate` | `"1000k"` | Target video bitrate |
 
 ---
 
-## Job Lifecycle
+## Job / Command lifecycle
 
 ```
 QUEUED → DOWNLOADING → PROCESSING → UPLOADING → SUCCESS
                                               ↘ FAILED
 ```
 
-Poll `GET /jobs/{id}` until `status` is `SUCCESS` or `FAILED`. Typical processing takes 1–30 seconds depending on file size and preset.
+Poll until `status` is `SUCCESS` or `FAILED`. Typical time: 0.5–30s.
 
 ---
 
 ## Webhook
 
-If `webhook_url` is provided, the worker sends a `POST` request to it on job completion (both SUCCESS and FAILED).
+On completion (SUCCESS or FAILED), the service POSTs to `webhook_url`:
 
-**Webhook payload** is identical to `GET /jobs/{id}` response:
+**Command webhook:**
+```json
+{
+  "command_id": "...",
+  "status": "SUCCESS",
+  "output_files": { "out_thumb": { "url": "https://...", "size_bytes": 42547 } },
+  "duration_seconds": 0.64
+}
+```
 
+**Job webhook:**
 ```json
 {
   "job_id": "...",
   "status": "SUCCESS",
   "output_url": "https://...",
-  ...
+  "duration_seconds": 1.2
 }
 ```
 
-> Webhook URL must start with `https://`.
-
 ---
 
-## Presets
+## MCP Server
 
-### 1. `transcode_h264_mp4`
+The `mcp/` directory contains an MCP server that exposes the API as tools for Claude and other LLM clients.
 
-Convert any video to H.264 video + AAC audio, MP4 container. Good for compatibility.
+### Tools
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `crf` | int | `23` | Quality factor (0=lossless, 51=worst). Lower = better quality + larger file |
-| `audio_bitrate` | string | `"128k"` | Audio bitrate (e.g. `"192k"`, `"64k"`) |
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "transcode_h264_mp4",
-    "input_url": "https://example.com/video.avi",
-    "output_filename": "output.mp4",
-    "preset_options": {
-      "crf": 20,
-      "audio_bitrate": "192k"
-    }
-  }'
-```
-
----
-
-### 2. `scale_fit_max`
-
-Scale video down to fit within maximum dimensions, preserving aspect ratio. Upscaling is never applied.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `max_width` | int | `1920` | Maximum output width in pixels |
-| `max_height` | int | `1080` | Maximum output height in pixels |
-| `crf` | int | `23` | Quality factor |
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "scale_fit_max",
-    "input_url": "https://example.com/4k-video.mp4",
-    "output_filename": "1080p.mp4",
-    "preset_options": {
-      "max_width": 1920,
-      "max_height": 1080
-    }
-  }'
-```
-
----
-
-### 3. `thumbnail_jpg`
-
-Extract a single frame from the video as a JPEG image.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `at_seconds` | float | `1.0` | Timestamp (in seconds) to grab the frame from |
-| `quality` | int | `5` | JPEG quality scale (`1`=best, `31`=worst) |
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "thumbnail_jpg",
-    "input_url": "https://example.com/video.mp4",
-    "output_filename": "thumb.jpg",
-    "preset_options": {
-      "at_seconds": 5.0,
-      "quality": 3
-    }
-  }'
-```
-
----
-
-### 4. `burn_subs`
-
-Burn subtitles (SRT or ASS/SSA format) permanently into the video. Requires an additional subtitle file URL.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `crf` | int | `23` | Quality factor |
-| **`input_subs_url`** | string | — | ⚠️ **Required.** HTTPS URL of the `.srt` or `.ass` subtitle file |
-
-`input_subs_url` is passed inside `preset_options`:
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "burn_subs",
-    "input_url": "https://example.com/video.mp4",
-    "output_filename": "with-subs.mp4",
-    "preset_options": {
-      "input_subs_url": "https://example.com/subtitles.srt",
-      "crf": 22
-    }
-  }'
-```
-
----
-
-### 5. `overlay_image`
-
-Overlay a PNG or JPG image (watermark, logo) on top of the video at a given position.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `x` | int | `10` | X offset of the overlay image in pixels |
-| `y` | int | `10` | Y offset of the overlay image in pixels |
-| `crf` | int | `23` | Quality factor |
-| **`input_overlay_url`** | string | — | ⚠️ **Required.** HTTPS URL of the overlay image (PNG recommended) |
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "overlay_image",
-    "input_url": "https://example.com/video.mp4",
-    "output_filename": "watermarked.mp4",
-    "preset_options": {
-      "input_overlay_url": "https://example.com/logo.png",
-      "x": 20,
-      "y": 20
-    }
-  }'
-```
-
----
-
-### 6. `extract_audio_mp3`
-
-Strip video track and save the audio as MP3.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `audio_bitrate` | string | `"128k"` | MP3 bitrate (e.g. `"192k"`, `"320k"`) |
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "extract_audio_mp3",
-    "input_url": "https://example.com/video.mp4",
-    "output_filename": "audio.mp3",
-    "preset_options": {
-      "audio_bitrate": "192k"
-    }
-  }'
-```
-
----
-
-### 7. `concat_videos`
-
-Concatenate multiple video files into one. Uses FFmpeg stream copy (no re-encoding) — files must have the same codec, resolution and frame rate.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| **`input_urls`** | array of strings | — | ⚠️ **Required.** List of HTTPS URLs to concatenate, **in order** |
-
-`input_url` in the main body is the **first** video; additional videos go in `preset_options.input_urls`.
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "concat_videos",
-    "input_url": "https://example.com/part1.mp4",
-    "output_filename": "full.mp4",
-    "preset_options": {
-      "input_urls": [
-        "https://example.com/part2.mp4",
-        "https://example.com/part3.mp4"
-      ]
-    }
-  }'
-```
-
----
-
-### 8. `hls_package`
-
-Package a video as HLS (HTTP Live Streaming): produces an `index.m3u8` playlist and `.ts` segments, zipped into a single archive.
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `hls_time` | int | `6` | Segment duration in seconds |
-| `video_bitrate` | string | `"1000k"` | Target video bitrate |
-
-Output is a `.zip` file containing `index.m3u8` and all segment files.
-
-```bash
-curl -X POST https://ffmpeg-api.kuprino.com/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preset": "hls_package",
-    "input_url": "https://example.com/video.mp4",
-    "output_filename": "hls.zip",
-    "preset_options": {
-      "hls_time": 4,
-      "video_bitrate": "800k"
-    }
-  }'
-```
-
----
-
-## Error Handling
-
-| HTTP status | Meaning |
+| Tool | Description |
 |---|---|
-| `202` | Job accepted and queued |
-| `400` | Bad request — invalid preset, unsafe URL, bad filename |
-| `404` | Job not found |
-| `422` | Validation error — missing required fields |
+| `ffmpeg_run_command` | Submit a raw FFmpeg command (polls until done by default) |
+| `ffmpeg_run_preset` | Submit a preset job |
+| `ffmpeg_get_command` | Get command status by ID |
+| `ffmpeg_get_job` | Get job status by ID |
+| `ffmpeg_health` | Check service health |
 
-When a job fails during processing, `status` is `FAILED` and `error` contains a description.
+### Setup
 
-**Unsafe URLs** — the service blocks requests to private IP ranges (RFC-1918) to prevent SSRF:
-- `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`
+**Requirements:** Python 3.10+, `pip install httpx`
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "ffmpeg-executor": {
+      "command": "python3",
+      "args": ["/path/to/ffmpeg-executor/mcp/server.py"],
+      "env": {
+        "FFMPEG_API_BASE": "https://ffmpeg-api.kuprino.com"
+      }
+    }
+  }
+}
+```
+
+**Cursor** (`.cursor/mcp.json` in project root):
+```json
+{
+  "mcpServers": {
+    "ffmpeg-executor": {
+      "command": "python3",
+      "args": ["mcp/server.py"],
+      "env": { "FFMPEG_API_BASE": "https://ffmpeg-api.kuprino.com" }
+    }
+  }
+}
+```
+
+**n8n MCP Client node:**
+```
+Command: python3
+Args: ["/path/to/mcp/server.py"]
+Env: FFMPEG_API_BASE=https://ffmpeg-api.kuprino.com
+```
+
+### Example Claude prompt
+
+Once connected via MCP:
+```
+Сделай превью для этого видео: https://example.com/video.mp4
+→ ffmpeg_run_command({ ffmpeg_command: "-i {{in_v}} -ss 3 -frames:v 1 -q:v 2 {{out_thumb}}", ... })
+→ returns public URL to the JPEG
+```
+
+---
+
+## Error handling
+
+| HTTP | Meaning |
+|---|---|
+| `202` | Accepted |
+| `400` | Bad request — unsafe URL, invalid preset/alias, blocked FFmpeg pattern |
+| `404` | Not found |
+| `422` | Missing required fields |
 
 ---
 
 ## Using from n8n
 
-1. Use an **HTTP Request** node with method `POST`, URL `https://ffmpeg-api.kuprino.com/jobs`, body type JSON.
-2. Get back `job_id`.
-3. Poll with a **Wait** node + loop, or configure `webhook_url` to point at an n8n Webhook node to receive the result automatically.
-
-**Poll pattern:**
+**Poll pattern (Command API):**
 ```
-HTTP Request (POST /jobs) → Set (save job_id) → Wait 5s → HTTP Request (GET /jobs/{{job_id}}) → IF status=SUCCESS → continue
-                                                                                                  ↘ IF status=FAILED → handle error
-                                                                                                  ↘ else → back to Wait
+HTTP Request POST /v1/commands
+  → Set: save command_id
+  → Wait 5s
+  → HTTP Request GET /v1/commands/{{command_id}}
+  → IF status == SUCCESS → use output_files.out_result.url
+  → IF status == FAILED  → handle error
+  → ELSE → back to Wait
 ```
 
 **Webhook pattern:**
 ```
-HTTP Request (POST /jobs, webhook_url=https://your-n8n.com/webhook/ffmpeg-done) → [wait for webhook trigger]
-Webhook node receives full job result → continue
+HTTP Request POST /v1/commands (webhook_url = n8n Webhook node URL)
+  → [n8n waits for webhook trigger]
+  → Webhook node receives full result with output_files
 ```
-
----
-
-## Security
-
-- `input_url` must use **HTTPS**
-- Private/internal IP ranges are blocked (SSRF protection)
-- `output_filename` allows only `[a-zA-Z0-9_\-. ]` characters
-- Service runs behind Cloudflare Tunnel — no open ports on the server

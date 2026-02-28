@@ -13,9 +13,12 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import sessionmaker
 
 from app.config import get_settings
-from app.models import Base, Job, JobStatus
-from app.schemas import HealthResponse, JobCreate, JobCreated, JobResponse
-from app.security import URLSecurityError, validate_input_url
+from app.models import Base, Job, JobStatus, Command
+from app.schemas import (
+    HealthResponse, JobCreate, JobCreated, JobResponse,
+    CommandCreate, CommandCreated, CommandResponse, OutputFileResult
+)
+from app.security import URLSecurityError, validate_input_url, validate_ffmpeg_command, CommandSecurityError
 
 settings = get_settings()
 
@@ -138,3 +141,76 @@ async def health():
 
     overall = "ok" if (redis_ok and postgres_ok) else "degraded"
     return HealthResponse(status=overall, api=True, redis=redis_ok, postgres=postgres_ok)
+
+# ── Command routes (Rendi-style raw FFmpeg) ───────────────────────────────────
+
+@app.post("/v1/commands", response_model=CommandCreated, status_code=202)
+async def create_command(payload: CommandCreate):
+    """Submit a raw FFmpeg command (Rendi-compatible API)."""
+    # Validate all input URLs (SSRF protection)
+    for alias, url in payload.input_files.items():
+        try:
+            validate_input_url(url)
+        except URLSecurityError as e:
+            raise HTTPException(status_code=400, detail=f"Unsafe URL for '{alias}': {e}")
+
+    # Validate the FFmpeg command for security
+    try:
+        validate_ffmpeg_command(
+            payload.ffmpeg_command,
+            input_aliases=set(payload.input_files.keys()),
+            output_aliases=set(payload.output_files.keys()),
+        )
+    except CommandSecurityError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    async with AsyncSessionLocal() as db:
+        cmd = Command(
+            ffmpeg_command=payload.ffmpeg_command,
+            input_files=payload.input_files,
+            output_files_spec=payload.output_files,
+            webhook_url=payload.webhook_url,
+            status=JobStatus.QUEUED,
+            stage="QUEUED",
+        )
+        db.add(cmd)
+        await db.commit()
+        await db.refresh(cmd)
+        cmd_id = cmd.id
+
+    from app.tasks import process_command
+    process_command.delay(str(cmd_id))
+
+    return CommandCreated(command_id=cmd_id)
+
+
+@app.get("/v1/commands/{command_id}", response_model=CommandResponse)
+async def get_command(command_id: uuid.UUID):
+    """Get status and result of a command."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Command).where(Command.id == command_id))
+        cmd = result.scalar_one_or_none()
+
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Command not found")
+
+    output_files = {}
+    for alias, data in (cmd.output_files_result or {}).items():
+        output_files[alias] = OutputFileResult(
+            url=data.get("url", ""),
+            size_bytes=data.get("size_bytes"),
+        )
+
+    return CommandResponse(
+        command_id=cmd.id,
+        status=cmd.status.value,
+        stage=cmd.stage,
+        ffmpeg_command=cmd.ffmpeg_command,
+        input_files=cmd.input_files or {},
+        output_files=output_files,
+        created_at=cmd.created_at,
+        started_at=cmd.started_at,
+        finished_at=cmd.finished_at,
+        duration_seconds=cmd.duration_seconds,
+        error=cmd.error_message,
+    )

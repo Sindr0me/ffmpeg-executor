@@ -36,8 +36,11 @@ def upload_file(local_path: str, job_id: str, output_filename: str) -> str:
         ExtraArgs={"ContentType": _content_type(output_filename)},
     )
 
-    # Build public URL
-    if settings.s3_endpoint_url:
+    # Build public URL — приоритет: S3_PUBLIC_URL > endpoint > AWS
+    if settings.s3_public_url:
+        base = settings.s3_public_url.rstrip("/")
+        url = f"{base}/{key}"
+    elif settings.s3_endpoint_url:
         base = settings.s3_endpoint_url.rstrip("/")
         url = f"{base}/{settings.s3_bucket}/{key}"
     else:

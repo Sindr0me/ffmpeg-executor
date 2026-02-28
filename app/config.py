@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_output_prefix: str = "ffmpeg-results"
     s3_region: str = "auto"
+    s3_public_url: str = ""
 
     # FFmpeg
     ffmpeg_max_run_seconds: int = 600

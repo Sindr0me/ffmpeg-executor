@@ -242,3 +242,107 @@ def process_job(self, job_id: str) -> None:
         db.close()
         if work_dir and os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
+
+@celery_app.task(bind=True, max_retries=0)
+def process_command(self, command_id: str) -> None:
+    from app.models import Command
+    from app.security import validate_ffmpeg_command, PLACEHOLDER_RE
+
+    db = SessionLocal()
+    work_dir = None
+    try:
+        cmd_obj = db.query(Command).filter(Command.id == command_id).first()
+        if not cmd_obj:
+            logger.error("Command %s not found", command_id)
+            return
+
+        work_dir = tempfile.mkdtemp(
+            dir=settings.ffmpeg_work_dir,
+            prefix=f"cmd_{command_id}_"
+        )
+
+        # ── DOWNLOAD PHASE ────────────────────────────────────────────
+        _set_status(db, cmd_obj, JobStatus.DOWNLOADING, "DOWNLOADING")
+
+        alias_to_path: dict[str, str] = {}
+
+        for alias, url in (cmd_obj.input_files or {}).items():
+            ext = url.rsplit(".", 1)[-1].split("?")[0][:8] or "bin"
+            local_path = os.path.join(work_dir, f"{alias}.{ext}")
+            _download_file(url, local_path)
+            alias_to_path[alias] = local_path
+            logger.info("Downloaded %s → %s", alias, local_path)
+
+        for alias, filename in (cmd_obj.output_files_spec or {}).items():
+            local_path = os.path.join(work_dir, filename)
+            alias_to_path[alias] = local_path
+
+        # ── PROCESSING PHASE ──────────────────────────────────────────
+        _set_status(db, cmd_obj, JobStatus.PROCESSING, "PROCESSING")
+
+        # Resolve placeholders in command
+        def replace_alias(m):
+            a = m.group(1)
+            if a not in alias_to_path:
+                raise RuntimeError(f"Alias '{a}' not resolved")
+            return alias_to_path[a]
+
+        resolved_cmd = PLACEHOLDER_RE.sub(replace_alias, cmd_obj.ffmpeg_command)
+
+        # Build ffmpeg args — add safety flags at the front
+        import shlex
+        raw_args = shlex.split(resolved_cmd)
+        ffmpeg_args = ["-nostdin", "-protocol_whitelist", "file,pipe"] + raw_args
+
+        stderr_tail = _run_ffmpeg(ffmpeg_args, timeout=settings.ffmpeg_max_run_seconds)
+        cmd_obj.ffmpeg_stderr = stderr_tail
+
+        # ── UPLOAD PHASE ──────────────────────────────────────────────
+        _set_status(db, cmd_obj, JobStatus.UPLOADING, "UPLOADING")
+
+        output_results: dict[str, dict] = {}
+        for alias, filename in (cmd_obj.output_files_spec or {}).items():
+            local_path = alias_to_path[alias]
+            if not os.path.exists(local_path):
+                raise RuntimeError(f"Output file for alias '{alias}' was not created: {filename}")
+            size_bytes = os.path.getsize(local_path)
+            pub_url = upload_file(local_path, command_id, filename)
+            output_results[alias] = {"url": pub_url, "size_bytes": size_bytes}
+            logger.info("Uploaded %s → %s", alias, pub_url)
+
+        cmd_obj.output_files_result = output_results
+        _set_status(db, cmd_obj, JobStatus.SUCCESS, "DONE")
+        logger.info("Command %s SUCCESS", command_id)
+
+        if cmd_obj.webhook_url:
+            _send_webhook(cmd_obj.webhook_url, {
+                "command_id": str(cmd_obj.id),
+                "status": "SUCCESS",
+                "output_files": output_results,
+                "duration_seconds": cmd_obj.duration_seconds,
+            })
+
+    except Exception as exc:
+        logger.exception("Command %s FAILED: %s", command_id, exc)
+        if db:
+            cmd_obj = db.query(Command).filter(Command.id == command_id).first()
+            if cmd_obj:
+                cmd_obj.status = JobStatus.FAILED
+                cmd_obj.error_message = str(exc)[:2000]
+                cmd_obj.finished_at = datetime.now(timezone.utc)
+                db.commit()
+
+                if cmd_obj.webhook_url:
+                    try:
+                        _send_webhook(cmd_obj.webhook_url, {
+                            "command_id": str(cmd_obj.id),
+                            "status": "FAILED",
+                            "output_files": {},
+                            "error": str(exc)[:500],
+                        })
+                    except Exception:
+                        pass
+    finally:
+        db.close()
+        if work_dir and os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
