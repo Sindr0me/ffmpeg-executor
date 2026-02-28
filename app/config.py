@@ -32,6 +32,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = False
+        extra = "ignore"  # ignore unknown env vars (e.g. CLOUDFLARE_TUNNEL_TOKEN used by docker-compose)
 
 
 @lru_cache()
