@@ -476,6 +476,224 @@ def _gif_export(input_path: str, output_path: str, options: dict, **_) -> list[s
 # Registry
 # ════════════════════════════════════════════════════════════════════════════
 
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# New Presets: v2 additions
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 17. replace_audio
+# ────────────────────────────────────────────────────────────────────────────
+
+def _replace_audio(input_path, output_path, options, extra_inputs, **_):
+    """Replace video audio track with a new audio file (TTS/voiceover)."""
+    audio_path = extra_inputs.get("input_audio_url", "")
+    if not audio_path:
+        raise ValueError("replace_audio requires input_audio_url")
+    volume = float(options.get("volume", 1.0))
+    loop_audio = str(options.get("loop_audio", "false")).lower() == "true"
+    shortest = str(options.get("shortest", "true")).lower() != "false"
+    audio_bitrate = options.get("audio_bitrate", "192k")
+    args = ["-nostdin", "-protocol_whitelist", "file,pipe",
+            "-i", input_path, "-i", audio_path]
+    if loop_audio or volume != 1.0:
+        chain = []
+        if loop_audio:
+            chain.append("aloop=loop=-1:size=2e+09")
+        if volume != 1.0:
+            chain.append(f"volume={volume}")
+        af = ",".join(chain)
+        args += ["-filter_complex", f"[1:a]{af}[aout]",
+                 "-map", "0:v", "-map", "[aout]"]
+    else:
+        args += ["-map", "0:v", "-map", "1:a"]
+    args += ["-c:v", "copy", "-c:a", "aac", "-b:a", audio_bitrate]
+    if shortest:
+        args.append("-shortest")
+    args += ["-movflags", "+faststart", "-y", output_path]
+    return args
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 18. resize_for_platform
+# ────────────────────────────────────────────────────────────────────────────
+
+_PLATFORM_PROFILES = {
+    "tiktok":           {"width": 1080, "height": 1920, "fps": 30,  "crf": 23, "audio_bitrate": "128k", "max_bitrate": "4000k"},
+    "instagram_reels":  {"width": 1080, "height": 1920, "fps": 30,  "crf": 23, "audio_bitrate": "128k", "max_bitrate": "3500k"},
+    "instagram_feed":   {"width": 1080, "height": 1080, "fps": 30,  "crf": 23, "audio_bitrate": "128k", "max_bitrate": "3500k"},
+    "youtube_shorts":   {"width": 1080, "height": 1920, "fps": 60,  "crf": 20, "audio_bitrate": "192k", "max_bitrate": "8000k"},
+    "youtube":          {"width": 1920, "height": 1080, "fps": 60,  "crf": 18, "audio_bitrate": "192k", "max_bitrate": "8000k"},
+    "facebook_ads":     {"width": 1080, "height": 1080, "fps": 30,  "crf": 23, "audio_bitrate": "128k", "max_bitrate": "4000k"},
+    "whatsapp":         {"width": 854,  "height": 480,  "fps": 25,  "crf": 28, "audio_bitrate": "96k",  "max_bitrate": "1200k"},
+    "twitter":          {"width": 1280, "height": 720,  "fps": 30,  "crf": 23, "audio_bitrate": "128k", "max_bitrate": "5000k"},
+    "linkedin":         {"width": 1920, "height": 1080, "fps": 30,  "crf": 23, "audio_bitrate": "128k", "max_bitrate": "5000k"},
+}
+
+
+def _resize_for_platform(input_path, output_path, options, **_):
+    """Re-encode for a specific social platform (tiktok, instagram_reels, youtube, etc.)."""
+    platform = options.get("platform", "tiktok").lower()
+    if platform not in _PLATFORM_PROFILES:
+        raise ValueError(f"Unknown platform '{platform}'. Available: {list(_PLATFORM_PROFILES.keys())}")
+    prof = _PLATFORM_PROFILES[platform]
+    w   = int(options.get("width",  prof["width"]))
+    h   = int(options.get("height", prof["height"]))
+    fps = int(options.get("fps",    prof["fps"]))
+    crf = int(options.get("crf",    prof["crf"]))
+    abr = options.get("audio_bitrate", prof["audio_bitrate"])
+    max_br = options.get("max_bitrate", prof["max_bitrate"])
+    fit = options.get("fit", "pad").lower()
+    if fit == "crop":
+        vf = (f"scale=if(gt(iw/ih\\,{w}/{h})\\,{h}*iw/ih\\,{w}):"
+              f"if(gt(iw/ih\\,{w}/{h})\\,{h}\\,{w}*ih/iw),"
+              f"crop={w}:{h},fps={fps}")
+    else:
+        vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps}")
+    bufsize = f"{int(max_br[:-1])*2}k"
+    return [
+        "-nostdin", "-protocol_whitelist", "file,pipe",
+        "-i", input_path, "-vf", vf,
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+        "-maxrate", max_br, "-bufsize", bufsize,
+        "-c:a", "aac", "-b:a", abr,
+        "-movflags", "+faststart", "-y", output_path,
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 19. compress_video
+# ────────────────────────────────────────────────────────────────────────────
+
+def _compress_video(input_path, output_path, options, work_dir, **_):
+    """Compress video. Use target_size_mb for 2-pass, or crf for simple mode."""
+    import subprocess
+    max_width  = int(options.get("max_width", 1280))
+    max_height = int(options.get("max_height", 720))
+    audio_bitrate = options.get("audio_bitrate", "96k")
+    target_mb = options.get("target_size_mb")
+    vf = (f"scale='min({max_width},iw)':'min({max_height},ih)'"
+          ":force_original_aspect_ratio=decrease,"
+          "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    if target_mb:
+        target_mb = float(target_mb)
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+            capture_output=True, text=True, timeout=30)
+        try:
+            duration = float(probe.stdout.strip())
+        except Exception:
+            duration = 60.0
+        audio_kbps = int(audio_bitrate.replace("k", "").replace("K", ""))
+        total_kbps = (target_mb * 8 * 1024) / duration
+        video_kbps = max(int(total_kbps - audio_kbps), 100)
+        video_br = f"{video_kbps}k"
+        passlog = os.path.join(work_dir, "ffmpeg2pass")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-i", input_path,
+             "-vf", vf, "-c:v", "libx264", "-b:v", video_br, "-preset", "slow",
+             "-pass", "1", "-passlogfile", passlog, "-an", "-f", "null", "-"],
+            capture_output=True, timeout=600)
+        return [
+            "-nostdin", "-i", input_path, "-vf", vf,
+            "-c:v", "libx264", "-b:v", video_br, "-preset", "slow",
+            "-pass", "2", "-passlogfile", passlog,
+            "-c:a", "aac", "-b:a", audio_bitrate,
+            "-movflags", "+faststart", "-y", output_path,
+        ]
+    crf = int(options.get("crf", 28))
+    return [
+        "-nostdin", "-protocol_whitelist", "file,pipe",
+        "-i", input_path, "-vf", vf,
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "slow",
+        "-c:a", "aac", "-b:a", audio_bitrate,
+        "-movflags", "+faststart", "-y", output_path,
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 20. clear_silence — Two-pass: detect silence → cut → stitch
+# ────────────────────────────────────────────────────────────────────────────
+
+def _clear_silence(input_path, output_path, options, work_dir, **_):
+    """Remove silent segments from video, returning a seamless continuous video.
+
+    Pass 1: silencedetect finds silence timestamps in stderr.
+    Pass 2: trim+atrim per segment, then concat filter stitches them.
+
+    Options:
+        noise_level (str, default "-35dB"):  silence threshold.
+        min_silence_duration (float, default 0.5): min silence length to cut (s).
+        padding (float, default 0.1): seconds of audio to keep around cuts.
+        crf (int, default 23): output quality.
+    """
+    import subprocess, re
+    noise_level = options.get("noise_level", "-35dB")
+    min_silence = float(options.get("min_silence_duration", 0.5))
+    padding     = float(options.get("padding", 0.1))
+    crf         = int(options.get("crf", 23))
+
+    # ── Pass 1: detect silence ──────────────────────────────────────────────
+    detect = subprocess.run(
+        ["ffmpeg", "-nostdin", "-i", input_path,
+         "-af", f"silencedetect=n={noise_level}:d={min_silence}",
+         "-vn", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=300)
+    stderr = detect.stderr
+
+    starts = list(map(float, re.findall(r"silence_start: ([\d.e+\-]+)", stderr)))
+    ends   = list(map(float, re.findall(r"silence_end: ([\d.e+\-]+)",   stderr)))
+
+    dur_m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", stderr)
+    total = (int(dur_m.group(1))*3600 + int(dur_m.group(2))*60 + float(dur_m.group(3))) if dur_m else 9999.0
+
+    # File ends during silence — add synthetic end
+    if len(ends) < len(starts):
+        ends.append(total)
+
+    # ── Build non-silent keep intervals ────────────────────────────────────
+    keep = []
+    prev = 0.0
+    for s_start, s_end in zip(starts, ends):
+        seg_end   = s_start - padding
+        seg_start = prev
+        if seg_end - seg_start > 0.15:
+            keep.append((max(0.0, seg_start), seg_end))
+        prev = s_end + padding
+    if total - prev > 0.15:
+        keep.append((prev, total))
+
+    # No silence found — just stream-copy
+    if not keep or not starts:
+        return ["-nostdin", "-protocol_whitelist", "file,pipe",
+                "-i", input_path, "-c", "copy", "-y", output_path]
+
+    # ── Pass 2: trim each segment + concat all ─────────────────────────────
+    n = len(keep)
+    fc_parts = []
+    for i, (s, e) in enumerate(keep):
+        fc_parts.append(
+            f"[0:v]trim=start={s:.4f}:end={e:.4f},setpts=PTS-STARTPTS[v{i}]")
+        fc_parts.append(
+            f"[0:a]atrim=start={s:.4f}:end={e:.4f},asetpts=PTS-STARTPTS[a{i}]")
+    interleaved = "".join(f"[v{i}][a{i}]" for i in range(n))
+    fc_parts.append(f"{interleaved}concat=n={n}:v=1:a=1[outv][outa]")
+
+    return [
+        "-nostdin", "-protocol_whitelist", "file,pipe",
+        "-i", input_path,
+        "-filter_complex", ";".join(fc_parts),
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", "-y", output_path,
+    ]
+
+
 PRESETS: dict[str, PresetDef] = {
     # ── Basic ──────────────────────────────────────────────────────────────
     "transcode_h264_mp4": PresetDef(
@@ -608,6 +826,36 @@ PRESETS: dict[str, PresetDef] = {
         build_cmd=_hls_package,
         defaults={"hls_time": 6, "video_bitrate": "1000k"},
     ),
+
+    "replace_audio": PresetDef(
+        name="replace_audio",
+        description="Replace video audio with TTS/voiceover file (ElevenLabs etc.)",
+        extra_input_fields=["input_audio_url"],
+        build_cmd=_replace_audio,
+        defaults={"volume": 1.0, "loop_audio": "false", "shortest": "true", "audio_bitrate": "192k"},
+    ),
+    "resize_for_platform": PresetDef(
+        name="resize_for_platform",
+        description="Re-encode for platform: tiktok/instagram_reels/instagram_feed/youtube_shorts/youtube/facebook_ads/whatsapp/twitter/linkedin",
+        extra_input_fields=[],
+        build_cmd=_resize_for_platform,
+        defaults={"platform": "tiktok", "fit": "pad"},
+    ),
+    "compress_video": PresetDef(
+        name="compress_video",
+        description="Compress video to small file size. Use target_size_mb for 2-pass or crf for simple.",
+        extra_input_fields=[],
+        build_cmd=_compress_video,
+        defaults={"max_width": 1280, "max_height": 720, "audio_bitrate": "96k", "crf": 28},
+    ),
+    "clear_silence": PresetDef(
+        name="clear_silence",
+        description="Detect and remove silent segments, return seamless video (2-pass: silencedetect + trim+concat)",
+        extra_input_fields=[],
+        build_cmd=_clear_silence,
+        defaults={"noise_level": "-35dB", "min_silence_duration": 0.5, "padding": 0.1, "crf": 23},
+    ),
+
 }
 
 
