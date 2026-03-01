@@ -1,25 +1,75 @@
-# FFmpeg Executor MCP Server
+# FFmpeg Executor — MCP Server Setup
 
-Model Context Protocol (MCP) server that exposes the ffmpeg-executor API as tools for LLM clients like Claude, Cursor, etc.
+This directory contains an [MCP](https://modelcontextprotocol.io) server that exposes the **ffmpeg-executor** API as tools for Claude and any other LLM client that supports the Model Context Protocol.
 
-## Installation
+Once connected, you can ask your AI assistant to process video directly in natural language — no API calls needed manually.
+
+---
+
+## What you get
+
+5 tools become available to the AI:
+
+| Tool | Description |
+|---|---|
+| `ffmpeg_run_preset` | Run a ready-made preset (thumbnail, transcode, crop, etc.) |
+| `ffmpeg_run_command` | Run any raw FFmpeg command (full flexibility) |
+| `ffmpeg_get_job` | Check preset job status by ID |
+| `ffmpeg_get_command` | Check command status by ID |
+| `ffmpeg_health` | Check if the service is healthy |
+
+---
+
+## Requirements
+
+- **Python 3.11+**
+- Internet access to `https://ffmpeg-api.kuprino.com`
+
+The server uses [PEP 723 inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/) — dependencies (`mcp`, `httpx`, `pydantic`) are installed **automatically** when you use `uv run`. No manual `pip install` needed.
+
+---
+
+## Option A — Claude Desktop
+
+### Step 1 — Download the server
 
 ```bash
-pip install -r requirements.txt
+curl -o ~/ffmpeg_executor_mcp.py \
+  https://raw.githubusercontent.com/Sindr0me/ffmpeg-executor/main/mcp/server.py
 ```
 
-## Usage
+Or clone the repo and use the file directly from `mcp/server.py`.
 
-### Via Claude Desktop
+### Step 2 — Install `uv` (if not already installed)
 
-Add to `~/.claude_desktop_config.json`:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+> `uv` is a fast Python package manager. The MCP server uses it to auto-install its own dependencies.
+
+### Step 3 — Edit Claude Desktop config
+
+Open the config file:
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+
+Add the following inside `"mcpServers"`:
 
 ```json
 {
   "mcpServers": {
     "ffmpeg-executor": {
-      "command": "python",
-      "args": ["/path/to/mcp/server.py"],
+      "command": "uv",
+      "args": [
+        "run",
+        "--with", "mcp[cli]",
+        "--with", "httpx",
+        "--with", "pydantic",
+        "/path/to/ffmpeg_executor_mcp.py"
+      ],
       "env": {
         "FFMPEG_API_BASE": "https://ffmpeg-api.kuprino.com"
       }
@@ -28,82 +78,219 @@ Add to `~/.claude_desktop_config.json`:
 }
 ```
 
-Then restart Claude Desktop and the tools will be available.
+> Replace `/path/to/ffmpeg_executor_mcp.py` with the actual path from Step 1, e.g. `/Users/yourname/ffmpeg_executor_mcp.py`
 
-### Via Cursor
-
-Similar setup in Cursor's MCP settings. Use the command:
-```
-python /path/to/mcp/server.py
-```
-
-### Via Any MCP Client
-
-Run the server directly:
+**Alternatively**, if you don't want to use `uv`, install dependencies manually and use `python3`:
 
 ```bash
-export FFMPEG_API_BASE="https://ffmpeg-api.kuprino.com"
-python server.py
+pip install "mcp[cli]" httpx pydantic
 ```
 
-The server reads JSON-RPC messages from stdin and writes responses to stdout.
-
-## Available Tools
-
-### ffmpeg_run_command
-
-Run a raw FFmpeg command with custom input/output file handling.
-
-**Example:**
 ```json
 {
-  "ffmpeg_command": "-i {{in_video}} -vf scale=1280:720 -c:v libx264 -crf 23 {{out_thumb}}",
-  "input_files": {
-    "in_video": "https://example.com/video.mp4"
-  },
-  "output_files": {
-    "out_thumb": "thumbnail.jpg"
-  },
-  "wait": true
+  "mcpServers": {
+    "ffmpeg-executor": {
+      "command": "python3",
+      "args": ["/path/to/ffmpeg_executor_mcp.py"],
+      "env": {
+        "FFMPEG_API_BASE": "https://ffmpeg-api.kuprino.com"
+      }
+    }
+  }
 }
 ```
 
-Input file aliases must start with `in_` and output aliases must start with `out_`.
+### Step 4 — Restart Claude Desktop
 
-### ffmpeg_run_preset
+Fully quit Claude Desktop (Cmd+Q / Alt+F4) and reopen it. The ffmpeg tools will appear when you start a new conversation.
 
-Run a pre-defined video processing preset.
+### Verify it's working
 
-**Available presets:**
-- `transcode_h264_mp4`: Convert to H.264 MP4
-- `scale_fit_max`: Scale down to max dimensions
-- `thumbnail_jpg`: Extract frame as JPEG
-- `burn_subs`: Burn subtitles into video
-- `overlay_image`: Overlay watermark/logo
-- `extract_audio_mp3`: Extract audio as MP3
-- `concat_videos`: Concatenate videos
-- `hls_package`: Package as HLS ZIP
+Ask Claude:
+```
+Check the ffmpeg executor health
+```
 
-### ffmpeg_get_command / ffmpeg_get_job
+Claude should call `ffmpeg_health` and reply with `{"status": "ok"}`.
 
-Poll the status of a previously submitted command or job.
+---
 
-### ffmpeg_health
+## Option B — Cursor
 
-Check if the ffmpeg-executor service is healthy.
+Create or edit `.cursor/mcp.json` in your project root (or `~/.cursor/mcp.json` for global config):
 
-## Configuration
+```json
+{
+  "mcpServers": {
+    "ffmpeg-executor": {
+      "command": "uv",
+      "args": [
+        "run",
+        "/path/to/mcp/server.py"
+      ],
+      "env": {
+        "FFMPEG_API_BASE": "https://ffmpeg-api.kuprino.com"
+      }
+    }
+  }
+}
+```
 
-Set the `FFMPEG_API_BASE` environment variable to point to your ffmpeg-executor instance.
+Restart Cursor. The tools will be available in Agent mode.
 
-Default: `https://ffmpeg-api.kuprino.com`
+---
 
-## Security
+## Option C — Windsurf
 
-- All input URLs must be HTTPS
-- FFmpeg commands are validated to prevent:
-  - Direct network access (must use input_files)
-  - Filesystem escapes
-  - Dangerous filter features
-  - Shell injection
-- All private IP ranges are blocked (SSRF protection)
+Open **Settings → MCP → Add Server** and paste:
+
+```json
+{
+  "ffmpeg-executor": {
+    "command": "uv",
+    "args": ["run", "/path/to/mcp/server.py"],
+    "env": {
+      "FFMPEG_API_BASE": "https://ffmpeg-api.kuprino.com"
+    }
+  }
+}
+```
+
+---
+
+## Option D — Claude Code (CLI)
+
+```bash
+claude mcp add ffmpeg-executor \
+  -e FFMPEG_API_BASE=https://ffmpeg-api.kuprino.com \
+  -- uv run /path/to/mcp/server.py
+```
+
+Or add to `~/.claude/claude.json` manually under `mcpServers`.
+
+---
+
+## Option E — Any MCP-compatible client
+
+Any client that speaks the [MCP stdio transport](https://modelcontextprotocol.io/docs/concepts/transports) can use this server.
+
+Start the server process:
+
+```bash
+FFMPEG_API_BASE=https://ffmpeg-api.kuprino.com uv run /path/to/server.py
+```
+
+The server communicates over **stdin/stdout** using JSON-RPC (MCP stdio protocol).
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `FFMPEG_API_BASE` | `https://ffmpeg-api.kuprino.com` | Override to point at a self-hosted instance |
+
+---
+
+## Available Presets (20 total)
+
+Once connected, you can ask the AI to use any of these presets:
+
+### BASIC
+| Preset | What it does |
+|---|---|
+| `transcode_h264_mp4` | Convert any video to H.264 + AAC MP4 |
+| `scale_fit_max` | Scale down to fit within max dimensions (default 1920×1080) |
+| `thumbnail_jpg` | Extract a frame as JPEG (default at 1 second) |
+| `extract_audio_mp3` | Strip and export the audio track as MP3 |
+
+### OVERLAYS
+| Preset | What it does |
+|---|---|
+| `burn_subs` | Burn SRT/ASS subtitles permanently into the video |
+| `overlay_image` | Add a watermark or logo at a given position |
+| `add_text` | Burn a text caption or CTA into the video |
+
+### SOCIAL MEDIA / UGC
+| Preset | What it does |
+|---|---|
+| `crop_to_aspect` | Center-crop to 9:16 / 4:5 / 1:1 / 16:9 |
+| `trim` | Cut a clip by start/end time or duration |
+| `speed_change` | Slow-motion (0.5×) or fast-forward (2–4×) |
+| `fade` | Fade-in and/or fade-out for video and audio |
+| `gif_export` | Export a short clip as an optimized GIF |
+
+### AUDIO
+| Preset | What it does |
+|---|---|
+| `normalize_loudness` | EBU R128 loudness normalization (target LUFS) |
+| `mix_audio` | Mix background music under the original audio |
+| `replace_audio` | Replace the audio track with a TTS/voiceover file |
+| `clear_silence` | Auto-detect and remove silent segments |
+
+### DELIVERY
+| Preset | What it does |
+|---|---|
+| `concat_videos` | Join multiple video files in sequence |
+| `hls_package` | Package as HLS playlist + segments (outputs a .zip) |
+| `resize_for_platform` | One-click encode for TikTok, Instagram, YouTube, etc. |
+| `compress_video` | Reduce file size by CRF or target MB (2-pass) |
+
+---
+
+## Example prompts
+
+After connecting the MCP server, you can use natural language:
+
+```
+Сделай превью из этого видео на 5-й секунде:
+https://example.com/video.mp4
+```
+
+```
+Обрежь видео до вертикального формата 9:16 для TikTok
+и добавь текст "Shop Now!" внизу:
+https://example.com/ad.mp4
+```
+
+```
+Сожми это видео до 50 МБ:
+https://example.com/big_video.mp4
+```
+
+```
+Замени аудиодорожку на этот TTS-файл:
+video: https://example.com/video.mp4
+audio: https://example.com/voiceover.mp3
+```
+
+```
+Подготовь видео для публикации в Instagram Reels
+(кроп, платформенные настройки, нормализация звука):
+https://example.com/raw.mp4
+```
+
+---
+
+## Troubleshooting
+
+**Tools don't appear in Claude Desktop**
+- Make sure you fully quit and reopened Claude Desktop after editing the config
+- Check the config file is valid JSON (no trailing commas, matching brackets)
+- On macOS, verify the path in `args` with `ls -la /path/to/server.py`
+
+**`uv: command not found`**
+- Run `curl -LsSf https://astral.sh/uv/install.sh | sh` and restart your terminal
+- Or use `python3` directly after running `pip install "mcp[cli]" httpx pydantic`
+
+**`ModuleNotFoundError: No module named 'mcp'`**
+- Switch to the `uv run` approach, or run `pip install "mcp[cli]" httpx pydantic`
+
+**Connection errors / timeout**
+- Check `ffmpeg_health` tool — if it fails, the API may be temporarily unavailable
+- Verify `FFMPEG_API_BASE` is set correctly
+- The server at `https://ffmpeg-api.kuprino.com` requires internet access
+
+**Job returns FAILED**
+- The `error` field in the response will explain the cause
+- Most common reasons: unsupported input format, preset option out of range, or SSRF-blocked URL (only public HTTPS URLs are accepted)
