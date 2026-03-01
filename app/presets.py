@@ -96,7 +96,6 @@ def _thumbnail_jpg(input_path: str, output_path: str, options: dict, **_) -> lis
 def _burn_subs(input_path: str, output_path: str, options: dict, extra_inputs: dict, **_) -> list[str]:
     subs_path = extra_inputs.get("input_subs_url", "")
     crf = int(options.get("crf", 23))
-    # Use subtitles filter; need to escape path for libass
     escaped = subs_path.replace("\\", "/").replace(":", "\\:")
     return [
         "-nostdin",
@@ -154,11 +153,10 @@ def _extract_audio_mp3(input_path: str, output_path: str, options: dict, **_) ->
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 7. concat_videos — handled specially in tasks.py (writes concat list file)
+# 7. concat_videos
 # ────────────────────────────────────────────────────────────────────────────
 
 def _concat_videos(input_path: str, output_path: str, options: dict, extra_inputs: dict, **_) -> list[str]:
-    # input_path is the concat list file written by tasks.py
     return [
         "-nostdin",
         "-protocol_whitelist", "file,pipe",
@@ -171,7 +169,7 @@ def _concat_videos(input_path: str, output_path: str, options: dict, extra_input
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 8. hls_package — output is a .zip of m3u8 + segments
+# 8. hls_package
 # ────────────────────────────────────────────────────────────────────────────
 
 def _hls_package(input_path: str, output_path: str, options: dict, work_dir: str, **_) -> list[str]:
@@ -195,11 +193,291 @@ def _hls_package(input_path: str, output_path: str, options: dict, work_dir: str
     ]
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# UGC / Social Media Presets
+# ════════════════════════════════════════════════════════════════════════════
+
+
 # ────────────────────────────────────────────────────────────────────────────
-# Registry
+# 9. crop_to_aspect — Center-crop to target aspect ratio
 # ────────────────────────────────────────────────────────────────────────────
 
+def _crop_to_aspect(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    ratio = options.get("aspect_ratio", "9:16")
+    w_r, h_r = (int(x) for x in ratio.split(":"))
+    crf = int(options.get("crf", 23))
+
+    # Center-crop to the largest rectangle of target ratio that fits in source.
+    # min(iw, ih*W/H) selects width: if source is wider than target, crop width.
+    # min(ih, iw*H/W) selects height: if source is taller than target, crop height.
+    # Ensure even dimensions with trunc()/2*2 for H.264 compatibility.
+    crop_filter = (
+        f"crop=min(iw\\,ih*{w_r}/{h_r}):min(ih\\,iw*{h_r}/{w_r})"
+        f":(iw-min(iw\\,ih*{w_r}/{h_r}))/2"
+        f":(ih-min(ih\\,iw*{h_r}/{w_r}))/2,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    )
+    return [
+        "-nostdin",
+        "-protocol_whitelist", "file,pipe",
+        "-i", input_path,
+        "-vf", crop_filter,
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 10. trim — Cut video to time range
+# ────────────────────────────────────────────────────────────────────────────
+
+def _trim(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    start = str(options.get("start_time", "0"))
+    duration = options.get("duration")
+    end = options.get("end_time")
+
+    args = ["-nostdin", "-protocol_whitelist", "file,pipe"]
+    # -ss before -i: fast key-frame seek
+    if start and start != "0":
+        args += ["-ss", start]
+    args += ["-i", input_path]
+    if duration:
+        args += ["-t", str(duration)]
+    elif end:
+        args += ["-to", str(end)]
+    args += ["-c", "copy", "-y", output_path]
+    return args
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 11. normalize_loudness — EBU R128 loudness normalization
+# ────────────────────────────────────────────────────────────────────────────
+
+def _normalize_loudness(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    target_lufs = float(options.get("target_lufs", -14.0))
+    target_lra  = float(options.get("target_lra", 7.0))
+    target_tp   = float(options.get("target_tp", -1.0))
+
+    loudnorm = f"loudnorm=I={target_lufs}:LRA={target_lra}:TP={target_tp}"
+    return [
+        "-nostdin",
+        "-protocol_whitelist", "file,pipe",
+        "-i", input_path,
+        "-af", loudnorm,
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 12. speed_change — Change playback speed
+# ────────────────────────────────────────────────────────────────────────────
+
+def _atempo_chain(speed: float) -> str:
+    """Build chained atempo filters. FFmpeg atempo range is [0.5, 2.0]."""
+    filters = []
+    remaining = speed
+    while remaining > 2.0 + 1e-9:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5 - 1e-9:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining:.6f}")
+    return ",".join(filters)
+
+
+def _speed_change(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    speed = float(options.get("speed", 1.5))
+    crf = int(options.get("crf", 23))
+    keep_audio = str(options.get("keep_audio", "true")).lower() != "false"
+
+    pts = 1.0 / speed
+    video_filter = f"setpts={pts:.6f}*PTS"
+
+    if keep_audio:
+        audio_filter = _atempo_chain(speed)
+        return [
+            "-nostdin",
+            "-protocol_whitelist", "file,pipe",
+            "-i", input_path,
+            "-filter_complex",
+            f"[0:v]{video_filter}[v];[0:a]{audio_filter}[a]",
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            "-y", output_path,
+        ]
+    else:
+        return [
+            "-nostdin",
+            "-protocol_whitelist", "file,pipe",
+            "-i", input_path,
+            "-filter:v", video_filter,
+            "-an",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+            "-movflags", "+faststart",
+            "-y", output_path,
+        ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 13. mix_audio — Overlay background music track
+# ────────────────────────────────────────────────────────────────────────────
+
+def _mix_audio(input_path: str, output_path: str, options: dict, extra_inputs: dict, **_) -> list[str]:
+    bg_path = extra_inputs.get("bg_music_url", "")
+    if not bg_path:
+        raise ValueError("mix_audio requires bg_music_url option with a valid URL")
+
+    main_vol = float(options.get("main_volume", 1.0))
+    bg_vol   = float(options.get("bg_volume", 0.15))
+    crf = int(options.get("crf", 23))
+
+    # Loop background music for the entire video duration, then mix
+    audio_filter = (
+        f"[1:a]aloop=loop=-1:size=2e+09,volume={bg_vol}[bg];"
+        f"[0:a]volume={main_vol}[main];"
+        f"[main][bg]amix=inputs=2:duration=first:dropout_transition=2[out]"
+    )
+
+    return [
+        "-nostdin",
+        "-protocol_whitelist", "file,pipe",
+        "-i", input_path,
+        "-i", bg_path,
+        "-filter_complex", audio_filter,
+        "-map", "0:v",
+        "-map", "[out]",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 14. fade — Fade in/out effects (video + audio)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _fade(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    fade_in  = float(options.get("fade_in_duration", 0.5))
+    fade_out = float(options.get("fade_out_duration", 0.5))
+    fade_out_start = options.get("fade_out_start")
+    audio_fade = str(options.get("audio_fade", "true")).lower() != "false"
+    crf = int(options.get("crf", 23))
+
+    vf_parts = []
+    af_parts = []
+
+    if fade_in > 0:
+        vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
+        if audio_fade:
+            af_parts.append(f"afade=t=in:st=0:d={fade_in}")
+
+    if fade_out > 0 and fade_out_start is not None:
+        vf_parts.append(f"fade=t=out:st={fade_out_start}:d={fade_out}")
+        if audio_fade:
+            af_parts.append(f"afade=t=out:st={fade_out_start}:d={fade_out}")
+
+    args = [
+        "-nostdin",
+        "-protocol_whitelist", "file,pipe",
+        "-i", input_path,
+    ]
+    if vf_parts:
+        args += ["-vf", ",".join(vf_parts)]
+    if af_parts:
+        args += ["-af", ",".join(af_parts)]
+    args += [
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
+    return args
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 15. add_text — Burn text overlay (captions, CTAs, brand name)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _add_text(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    text       = options.get("text", "Sample Text")
+    x          = options.get("x", "(w-text_w)/2")
+    y          = options.get("y", "h-th-40")
+    fontsize   = int(options.get("fontsize", 52))
+    fontcolor  = options.get("fontcolor", "white")
+    box        = str(options.get("box", "true")).lower() != "false"
+    boxcolor   = options.get("boxcolor", "black@0.55")
+    boxborder  = int(options.get("boxborderw", 8))
+    start_time = options.get("start_time")
+    end_time   = options.get("end_time")
+    crf = int(options.get("crf", 23))
+
+    # Escape special drawtext characters
+    safe_text = text.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
+
+    draw = (
+        f"drawtext=text='{safe_text}'"
+        f":x={x}:y={y}"
+        f":fontsize={fontsize}"
+        f":fontcolor={fontcolor}"
+    )
+    if box:
+        draw += f":box=1:boxcolor={boxcolor}:boxborderw={boxborder}"
+
+    if start_time is not None:
+        draw += f":enable='between(t\\,{start_time}\\,{end_time or 99999})'"
+
+    return [
+        "-nostdin",
+        "-protocol_whitelist", "file,pipe",
+        "-i", input_path,
+        "-vf", draw,
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 16. gif_export — Optimized GIF with palette generation
+# ────────────────────────────────────────────────────────────────────────────
+
+def _gif_export(input_path: str, output_path: str, options: dict, **_) -> list[str]:
+    fps      = int(options.get("fps", 15))
+    width    = int(options.get("width", 480))
+    start    = options.get("start_time", 0)
+    duration = options.get("duration", 5)
+
+    # Single-pass palette-optimized GIF generation
+    vf = (
+        f"fps={fps},scale={width}:-1:flags=lanczos,"
+        f"split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer"
+    )
+    args = ["-nostdin", "-protocol_whitelist", "file,pipe"]
+    if start:
+        args += ["-ss", str(start)]
+    args += ["-i", input_path]
+    if duration:
+        args += ["-t", str(duration)]
+    args += ["-vf", vf, "-loop", "0", "-y", output_path]
+    return args
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Registry
+# ════════════════════════════════════════════════════════════════════════════
+
 PRESETS: dict[str, PresetDef] = {
+    # ── Basic ──────────────────────────────────────────────────────────────
     "transcode_h264_mp4": PresetDef(
         name="transcode_h264_mp4",
         description="Convert video to H.264 + AAC MP4",
@@ -221,6 +499,15 @@ PRESETS: dict[str, PresetDef] = {
         build_cmd=_thumbnail_jpg,
         defaults={"at_seconds": 1, "quality": 5},
     ),
+    "extract_audio_mp3": PresetDef(
+        name="extract_audio_mp3",
+        description="Extract audio track as MP3",
+        extra_input_fields=[],
+        build_cmd=_extract_audio_mp3,
+        defaults={"audio_bitrate": "128k"},
+    ),
+
+    # ── Overlays ───────────────────────────────────────────────────────────
     "burn_subs": PresetDef(
         name="burn_subs",
         description="Burn subtitles (SRT/ASS) into video",
@@ -235,17 +522,82 @@ PRESETS: dict[str, PresetDef] = {
         build_cmd=_overlay_image,
         defaults={"x": 10, "y": 10, "crf": 23},
     ),
-    "extract_audio_mp3": PresetDef(
-        name="extract_audio_mp3",
-        description="Extract audio track as MP3",
+    "add_text": PresetDef(
+        name="add_text",
+        description="Burn text overlay — captions, CTAs, brand name",
         extra_input_fields=[],
-        build_cmd=_extract_audio_mp3,
-        defaults={"audio_bitrate": "128k"},
+        build_cmd=_add_text,
+        defaults={
+            "text": "Sample Text",
+            "x": "(w-text_w)/2",
+            "y": "h-th-40",
+            "fontsize": 52,
+            "fontcolor": "white",
+            "box": "true",
+            "boxcolor": "black@0.55",
+            "boxborderw": 8,
+            "crf": 23,
+        },
     ),
+
+    # ── Social Media / UGC ─────────────────────────────────────────────────
+    "crop_to_aspect": PresetDef(
+        name="crop_to_aspect",
+        description="Center-crop video to target aspect ratio (9:16, 4:5, 1:1, 16:9)",
+        extra_input_fields=[],
+        build_cmd=_crop_to_aspect,
+        defaults={"aspect_ratio": "9:16", "crf": 23},
+    ),
+    "trim": PresetDef(
+        name="trim",
+        description="Trim video to a time range (stream-copy, instant)",
+        extra_input_fields=[],
+        build_cmd=_trim,
+        defaults={"start_time": "0"},
+    ),
+    "speed_change": PresetDef(
+        name="speed_change",
+        description="Change playback speed (0.25x–4x, slowmo or fast-forward)",
+        extra_input_fields=[],
+        build_cmd=_speed_change,
+        defaults={"speed": 1.5, "crf": 23, "keep_audio": "true"},
+    ),
+    "fade": PresetDef(
+        name="fade",
+        description="Add fade-in and/or fade-out (video + audio)",
+        extra_input_fields=[],
+        build_cmd=_fade,
+        defaults={"fade_in_duration": 0.5, "fade_out_duration": 0.5, "audio_fade": "true", "crf": 23},
+    ),
+    "gif_export": PresetDef(
+        name="gif_export",
+        description="Export video clip as optimized GIF (palette-based)",
+        extra_input_fields=[],
+        build_cmd=_gif_export,
+        defaults={"fps": 15, "width": 480, "start_time": 0, "duration": 5},
+    ),
+
+    # ── Audio ──────────────────────────────────────────────────────────────
+    "normalize_loudness": PresetDef(
+        name="normalize_loudness",
+        description="Normalize audio loudness (EBU R128) — YouTube/TikTok/broadcast",
+        extra_input_fields=[],
+        build_cmd=_normalize_loudness,
+        defaults={"target_lufs": -14.0, "target_lra": 7.0, "target_tp": -1.0},
+    ),
+    "mix_audio": PresetDef(
+        name="mix_audio",
+        description="Mix background music into video with volume control",
+        extra_input_fields=["bg_music_url"],
+        build_cmd=_mix_audio,
+        defaults={"main_volume": 1.0, "bg_volume": 0.15, "crf": 23},
+    ),
+
+    # ── Delivery ───────────────────────────────────────────────────────────
     "concat_videos": PresetDef(
         name="concat_videos",
         description="Concatenate multiple videos (stream copy)",
-        extra_input_fields=["input_urls"],  # list of URLs in options
+        extra_input_fields=["input_urls"],
         build_cmd=_concat_videos,
         defaults={},
     ),

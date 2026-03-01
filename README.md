@@ -42,7 +42,7 @@ caller (n8n / Claude / curl)
 
 ## Command API — raw FFmpeg (Rendi-compatible)
 
-Full FFmpeg expressivity: pass any FFmpeg arguments as a string.  
+Full FFmpeg expressivity: pass any FFmpeg arguments as a string.
 Input and output files are referenced via `{{alias}}` placeholders.
 
 ### POST /v1/commands
@@ -212,7 +212,9 @@ Same structure as `/v1/commands/{id}`, but with single `output_url` (string) ins
 
 ## Available Presets
 
-### `transcode_h264_mp4`
+### BASIC PRESETS
+
+#### `transcode_h264_mp4`
 Convert any video to H.264 + AAC, MP4 container.
 
 | Option | Default | Description |
@@ -226,7 +228,7 @@ curl -X POST https://ffmpeg-api.kuprino.com/jobs \
   -d '{"preset":"transcode_h264_mp4","input_url":"https://example.com/video.avi","output_filename":"out.mp4","preset_options":{"crf":20}}'
 ```
 
-### `scale_fit_max`
+#### `scale_fit_max`
 Scale down to fit within max dimensions (never upscales), preserve aspect ratio.
 
 | Option | Default | Description |
@@ -235,7 +237,13 @@ Scale down to fit within max dimensions (never upscales), preserve aspect ratio.
 | `max_height` | `1080` | Max height px |
 | `crf` | `23` | Quality |
 
-### `thumbnail_jpg`
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"scale_fit_max","input_url":"https://example.com/4k.mp4","output_filename":"scaled.mp4","preset_options":{"max_width":1280,"max_height":720}}'
+```
+
+#### `thumbnail_jpg`
 Extract a single frame as JPEG.
 
 | Option | Default | Description |
@@ -243,7 +251,30 @@ Extract a single frame as JPEG.
 | `at_seconds` | `1.0` | Timestamp to grab frame |
 | `quality` | `5` | JPEG quality (1=best, 31=worst) |
 
-### `burn_subs`
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"thumbnail_jpg","input_url":"https://example.com/video.mp4","output_filename":"thumb.jpg","preset_options":{"at_seconds":5.0}}'
+```
+
+#### `extract_audio_mp3`
+Extract audio track as MP3.
+
+| Option | Default | Description |
+|---|---|---|
+| `audio_bitrate` | `"128k"` | Bitrate |
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"extract_audio_mp3","input_url":"https://example.com/video.mp4","output_filename":"audio.mp3","preset_options":{"audio_bitrate":"192k"}}'
+```
+
+---
+
+### OVERLAYS & TEXT
+
+#### `burn_subs`
 Burn SRT/ASS subtitles permanently into video.
 
 | Option | Default | Description |
@@ -251,7 +282,13 @@ Burn SRT/ASS subtitles permanently into video.
 | `input_subs_url` | — | ⚠️ Required. URL of `.srt` or `.ass` file |
 | `crf` | `23` | Quality |
 
-### `overlay_image`
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"burn_subs","input_url":"https://example.com/video.mp4","output_filename":"subbed.mp4","preset_options":{"input_subs_url":"https://example.com/subs.srt"}}'
+```
+
+#### `overlay_image`
 Overlay PNG/JPG watermark at a given position.
 
 | Option | Default | Description |
@@ -261,27 +298,202 @@ Overlay PNG/JPG watermark at a given position.
 | `y` | `10` | Y offset px |
 | `crf` | `23` | Quality |
 
-### `extract_audio_mp3`
-Extract audio track as MP3.
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"overlay_image","input_url":"https://example.com/video.mp4","output_filename":"watermarked.mp4","preset_options":{"input_overlay_url":"https://example.com/logo.png","x":20,"y":20}}'
+```
+
+#### `add_text`
+Burn text overlay (captions, CTAs, brand name).
 
 | Option | Default | Description |
 |---|---|---|
-| `audio_bitrate` | `"128k"` | Bitrate |
+| `text` | — | ⚠️ Required. Text to display |
+| `x` | `"(w-text_w)/2"` | X position (centered by default) |
+| `y` | `"h-th-40"` | Y position (bottom by default) |
+| `fontsize` | `52` | Font size px |
+| `fontcolor` | `"white"` | Font color |
+| `box` | `"true"` | Draw background box |
+| `boxcolor` | `"black@0.55"` | Box background color + alpha |
+| `boxborderw` | `8` | Box border width |
+| `start_time` | — | Start time (seconds) |
+| `end_time` | — | End time (seconds) |
+| `crf` | `23` | Quality |
 
-### `concat_videos`
-Concatenate videos via stream copy (same codec/resolution required).
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"add_text","input_url":"https://example.com/video.mp4","output_filename":"captioned.mp4","preset_options":{"text":"Shop Now!","fontsize":60,"fontcolor":"white","start_time":0,"end_time":5}}'
+```
+
+---
+
+### SOCIAL MEDIA & UGC
+
+#### `crop_to_aspect`
+Center-crop to target aspect ratio (reformat landscape for vertical platforms).
+
+| Option | Default | Description |
+|---|---|---|
+| `aspect_ratio` | `"9:16"` | Target ratio (`"9:16"`, `"4:5"`, `"1:1"`, `"16:9"`) |
+| `crf` | `23` | Quality |
+
+**Use cases:** TikTok/Instagram Reels (9:16), Instagram feed (4:5), YouTube (16:9), square (1:1)
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"crop_to_aspect","input_url":"https://example.com/landscape.mp4","output_filename":"vertical.mp4","preset_options":{"aspect_ratio":"9:16"}}'
+```
+
+#### `trim`
+Trim video to time range (stream-copy, instant processing).
+
+| Option | Default | Description |
+|---|---|---|
+| `start_time` | `"0"` | Start time (seconds or HH:MM:SS) |
+| `end_time` | — | End time (seconds or HH:MM:SS) |
+| `duration` | — | Duration (seconds or HH:MM:SS) — use either `end_time` or `duration` |
+
+**Use cases:** Cut clips from longer videos, extract highlights, trim dead air
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"trim","input_url":"https://example.com/long-video.mp4","output_filename":"clip.mp4","preset_options":{"start_time":"10","duration":"30"}}'
+```
+
+#### `speed_change`
+Change playback speed (0.25x to 4x range).
+
+| Option | Default | Description |
+|---|---|---|
+| `speed` | `1.5` | Speed multiplier (0.25–4.0) |
+| `keep_audio` | `"true"` | Preserve audio pitch (true) or speed audio too (false) |
+| `crf` | `23` | Quality |
+
+**Use cases:** Slow-motion (0.5x), time-lapse (2x–4x), fast-forward, UGC transitions
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"speed_change","input_url":"https://example.com/video.mp4","output_filename":"slowmo.mp4","preset_options":{"speed":0.5,"keep_audio":"true"}}'
+```
+
+#### `fade`
+Fade in/out effects for both video and audio.
+
+| Option | Default | Description |
+|---|---|---|
+| `fade_in_duration` | `0.5` | Fade-in length (seconds) |
+| `fade_out_duration` | `0.5` | Fade-out length (seconds) |
+| `fade_out_start` | — | When fade-out begins (seconds from end, or absolute time) |
+| `audio_fade` | `"true"` | Apply fade to audio too |
+| `crf` | `23` | Quality |
+
+**Use cases:** Professional transitions, ad clips, smooth intros/outros
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"fade","input_url":"https://example.com/video.mp4","output_filename":"faded.mp4","preset_options":{"fade_in_duration":1.0,"fade_out_duration":1.0,"audio_fade":"true"}}'
+```
+
+#### `gif_export`
+Export video as optimized GIF with custom frame rate and resolution.
+
+| Option | Default | Description |
+|---|---|---|
+| `fps` | `15` | Frames per second |
+| `width` | `480` | Output width px |
+| `start_time` | `0` | Start timestamp (seconds) |
+| `duration` | `5` | Duration to export (seconds) |
+
+**Use cases:** Social preview GIFs, ad previews, animated thumbnails
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"gif_export","input_url":"https://example.com/video.mp4","output_filename":"preview.gif","preset_options":{"fps":15,"width":480,"duration":5}}'
+```
+
+---
+
+### AUDIO
+
+#### `normalize_loudness`
+EBU R128 loudness normalization (LUFS-based).
+
+| Option | Default | Description |
+|---|---|---|
+| `target_lufs` | `-14.0` | Target loudness in LUFS |
+| `target_lra` | `7.0` | Loudness range (LRA) |
+| `target_tp` | `-1.0` | True peak limit |
+
+**Use cases:**
+- YouTube/Spotify: -14 LUFS
+- TikTok/Instagram/Meta: -16 LUFS
+- Broadcast: -23 LUFS
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"normalize_loudness","input_url":"https://example.com/video.mp4","output_filename":"normalized.mp4","preset_options":{"target_lufs":-14.0}}'
+```
+
+#### `mix_audio`
+Mix background music into video (loops if shorter).
+
+| Option | Default | Description |
+|---|---|---|
+| `bg_music_url` | — | ⚠️ Required. URL of background music file |
+| `bg_volume` | `0.15` | Background music volume (0–1) |
+| `main_volume` | `1.0` | Original audio volume (0–1) |
+| `crf` | `23` | Quality |
+
+**Use cases:** Add music loops to UGC clips, background tracks for ads, licensed music beds
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"mix_audio","input_url":"https://example.com/video.mp4","output_filename":"with_music.mp4","preset_options":{"bg_music_url":"https://example.com/music.mp3","bg_volume":0.2}}'
+```
+
+---
+
+### DELIVERY & PACKAGING
+
+#### `concat_videos`
+Concatenate multiple videos via stream copy (same codec/resolution required).
 
 | Option | Default | Description |
 |---|---|---|
 | `input_urls` | — | ⚠️ Required. Array of additional video URLs (in order after `input_url`) |
 
-### `hls_package`
+**Use cases:** Compile highlight reels, merge video segments, create compilations
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"concat_videos","input_url":"https://example.com/video1.mp4","output_filename":"merged.mp4","preset_options":{"input_urls":["https://example.com/video2.mp4","https://example.com/video3.mp4"]}}'
+```
+
+#### `hls_package`
 Package video as HLS playlist + segments, output as `.zip`.
 
 | Option | Default | Description |
 |---|---|---|
 | `hls_time` | `6` | Segment duration (seconds) |
 | `video_bitrate` | `"1000k"` | Target video bitrate |
+
+**Use cases:** Adaptive bitrate streaming, CDN delivery, multi-quality playback
+
+```bash
+curl -X POST https://ffmpeg-api.kuprino.com/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"preset":"hls_package","input_url":"https://example.com/video.mp4","output_filename":"stream.zip","preset_options":{"hls_time":6,"video_bitrate":"2500k"}}'
+```
 
 ---
 
@@ -331,10 +543,22 @@ The `mcp/` directory contains an MCP server that exposes the API as tools for Cl
 | Tool | Description |
 |---|---|
 | `ffmpeg_run_command` | Submit a raw FFmpeg command (polls until done by default) |
-| `ffmpeg_run_preset` | Submit a preset job |
+| `ffmpeg_run_preset` | Submit a preset job (supports all 16 presets) |
 | `ffmpeg_get_command` | Get command status by ID |
 | `ffmpeg_get_job` | Get job status by ID |
 | `ffmpeg_health` | Check service health |
+
+### Available Presets (16 total)
+
+**BASIC:** `transcode_h264_mp4`, `scale_fit_max`, `thumbnail_jpg`, `extract_audio_mp3`
+
+**OVERLAYS:** `burn_subs`, `overlay_image`, `add_text`
+
+**SOCIAL MEDIA / UGC:** `crop_to_aspect`, `trim`, `speed_change`, `fade`, `gif_export`
+
+**AUDIO:** `normalize_loudness`, `mix_audio`
+
+**DELIVERY:** `concat_videos`, `hls_package`
 
 ### Setup
 
@@ -380,8 +604,18 @@ Env: FFMPEG_API_BASE=https://ffmpeg-api.kuprino.com
 Once connected via MCP:
 ```
 Сделай превью для этого видео: https://example.com/video.mp4
-→ ffmpeg_run_command({ ffmpeg_command: "-i {{in_v}} -ss 3 -frames:v 1 -q:v 2 {{out_thumb}}", ... })
+→ ffmpeg_run_preset({ preset: "thumbnail_jpg", input_url: "https://example.com/video.mp4", output_filename: "thumb.jpg" })
 → returns public URL to the JPEG
+```
+
+### Example: Create UGC Ad from Raw Video
+
+```
+Реформат видео для TikTok (9:16), добавь текст "Shop Now!", нормализуй звук и сделай превью
+→ ffmpeg_run_preset({ preset: "crop_to_aspect", input_url: "...", output_filename: "vertical.mp4", preset_options: { aspect_ratio: "9:16" } })
+→ ffmpeg_run_preset({ preset: "add_text", input_url: "[result]", output_filename: "with_cta.mp4", preset_options: { text: "Shop Now!" } })
+→ ffmpeg_run_preset({ preset: "normalize_loudness", input_url: "[result]", output_filename: "normalized.mp4", preset_options: { target_lufs: -16.0 } })
+→ ffmpeg_run_preset({ preset: "thumbnail_jpg", input_url: "[result]", output_filename: "preview.jpg" })
 ```
 
 ---
