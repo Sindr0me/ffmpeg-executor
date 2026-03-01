@@ -16,6 +16,7 @@ class JobCreate(BaseModel):
     output_filename: str
     webhook_url: Optional[str] = None
     metadata: dict[str, Any] = {}
+    output_presigned_url: Optional[str] = None  # if set, upload result here instead of R2
 
     @field_validator("input_url")
     @classmethod
@@ -28,7 +29,7 @@ class JobCreate(BaseModel):
     @classmethod
     def safe_filename(cls, v: str) -> str:
         import re
-        if not re.match(r'^[\w\-. ]+$', v):
+        if not re.match(r"^[\w\-. ]+$", v):
             raise ValueError("output_filename contains invalid characters")
         return v
 
@@ -64,16 +65,17 @@ class HealthResponse(BaseModel):
 
 class CommandCreate(BaseModel):
     ffmpeg_command: str
-    input_files: dict[str, str] = {}   # {"in_video": "https://..."}
-    output_files: dict[str, str] = {}  # {"out_result": "output.mp4"}
+    input_files: dict[str, str] = {}    # {"in_video": "https://..."}
+    output_files: dict[str, str] = {}   # {"out_result": "output.mp4"}
     webhook_url: Optional[str] = None
+    output_presigned_urls: Optional[dict[str, str]] = None  # {alias: presigned_url}
 
     @field_validator("input_files")
     @classmethod
     def validate_input_aliases(cls, v: dict) -> dict:
         for key in v:
             if not key.startswith("in_"):
-                raise ValueError(f"input_files keys must start with 'in_', got: '{key}'")
+                raise ValueError(f"input_files keys must start with in_, got: {key}")
         return v
 
     @field_validator("output_files")
@@ -82,9 +84,9 @@ class CommandCreate(BaseModel):
         import re
         for key, filename in v.items():
             if not key.startswith("out_"):
-                raise ValueError(f"output_files keys must start with 'out_', got: '{key}'")
-            if not re.match(r'^[\w\-. ]+$', filename):
-                raise ValueError(f"output filename '{filename}' contains invalid characters")
+                raise ValueError(f"output_files keys must start with out_, got: {key}")
+            if not re.match(r"^[\w\-. ]+$", filename):
+                raise ValueError(f"output filename {filename} contains invalid characters")
         return v
 
 

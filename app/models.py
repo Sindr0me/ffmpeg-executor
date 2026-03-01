@@ -34,6 +34,7 @@ class Job(Base):
     input_url = Column(Text, nullable=False)
     output_filename = Column(String(255), nullable=False)
     output_url = Column(Text, nullable=True)
+    output_presigned_url = Column(Text, nullable=True)  # optional caller-supplied presigned URL
 
     webhook_url = Column(Text, nullable=True)
     metadata_ = Column("metadata", JSON, nullable=True, default=dict)
@@ -62,9 +63,10 @@ class Command(Base):
     stage = Column(String(64), default="QUEUED")
 
     ffmpeg_command = Column(Text, nullable=False)
-    input_files = Column(JSON, default=dict)       # {alias: url}
+    input_files = Column(JSON, default=dict)        # {alias: url}
     output_files_spec = Column(JSON, default=dict)  # {alias: filename}
     output_files_result = Column(JSON, default=dict) # {alias: {url, size_bytes}}
+    output_presigned_urls = Column(JSON, nullable=True, default=dict)  # {alias: presigned_url}
 
     webhook_url = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)

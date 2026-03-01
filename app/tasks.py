@@ -21,7 +21,7 @@ from app.config import get_settings
 from app.models import Job, JobStatus
 from app.presets import get_preset
 from app.security import validate_input_url
-from app.storage import upload_file
+from app.storage import upload_file, upload_to_presigned_url
 
 settings = get_settings()
 
@@ -156,7 +156,7 @@ def process_job(self, job_id: str) -> None:
                     paths.append(p)
                 with open(concat_list_path, "w") as f:
                     for p in paths:
-                        f.write(f"file '{p}'\n")
+                        f.write(f"file {p}\n")
                 input_path = concat_list_path  # override primary input
             else:
                 url = options.get(field_name, "")
@@ -200,7 +200,13 @@ def process_job(self, job_id: str) -> None:
         # ── UPLOAD PHASE ──────────────────────────────────────────────────
         _set_status(db, job, JobStatus.UPLOADING, "UPLOADING")
 
-        output_url = upload_file(output_path, str(job.id), job.output_filename)
+        if job.output_presigned_url:
+            # Upload directly to caller-supplied S3 presigned URL
+            logger.info("Job %s: uploading via presigned URL", job_id)
+            output_url = upload_to_presigned_url(output_path, job.output_presigned_url)
+        else:
+            output_url = upload_file(output_path, str(job.id), job.output_filename)
+
         job.output_url = output_url
         _set_status(db, job, JobStatus.SUCCESS, "DONE")
 
@@ -261,7 +267,7 @@ def process_command(self, command_id: str) -> None:
             prefix=f"cmd_{command_id}_"
         )
 
-        # ── DOWNLOAD PHASE ────────────────────────────────────────────
+        # ── DOWNLOAD PHASE ────────────────────────────────────────────────
         _set_status(db, cmd_obj, JobStatus.DOWNLOADING, "DOWNLOADING")
 
         alias_to_path: dict[str, str] = {}
@@ -277,14 +283,14 @@ def process_command(self, command_id: str) -> None:
             local_path = os.path.join(work_dir, filename)
             alias_to_path[alias] = local_path
 
-        # ── PROCESSING PHASE ──────────────────────────────────────────
+        # ── PROCESSING PHASE ──────────────────────────────────────────────
         _set_status(db, cmd_obj, JobStatus.PROCESSING, "PROCESSING")
 
         # Resolve placeholders in command
         def replace_alias(m):
             a = m.group(1)
             if a not in alias_to_path:
-                raise RuntimeError(f"Alias '{a}' not resolved")
+                raise RuntimeError(f"Alias {a} not resolved")
             return alias_to_path[a]
 
         resolved_cmd = PLACEHOLDER_RE.sub(replace_alias, cmd_obj.ffmpeg_command)
@@ -297,16 +303,25 @@ def process_command(self, command_id: str) -> None:
         stderr_tail = _run_ffmpeg(ffmpeg_args, timeout=settings.ffmpeg_max_run_seconds)
         cmd_obj.ffmpeg_stderr = stderr_tail
 
-        # ── UPLOAD PHASE ──────────────────────────────────────────────
+        # ── UPLOAD PHASE ──────────────────────────────────────────────────
         _set_status(db, cmd_obj, JobStatus.UPLOADING, "UPLOADING")
 
+        presigned_map = cmd_obj.output_presigned_urls or {}
         output_results: dict[str, dict] = {}
+
         for alias, filename in (cmd_obj.output_files_spec or {}).items():
             local_path = alias_to_path[alias]
             if not os.path.exists(local_path):
-                raise RuntimeError(f"Output file for alias '{alias}' was not created: {filename}")
+                raise RuntimeError(f"Output file for alias {alias} was not created: {filename}")
             size_bytes = os.path.getsize(local_path)
-            pub_url = upload_file(local_path, command_id, filename)
+
+            if alias in presigned_map:
+                # Upload to caller-supplied presigned URL for this alias
+                logger.info("Command %s: uploading %s via presigned URL", command_id, alias)
+                pub_url = upload_to_presigned_url(local_path, presigned_map[alias])
+            else:
+                pub_url = upload_file(local_path, command_id, filename)
+
             output_results[alias] = {"url": pub_url, "size_bytes": size_bytes}
             logger.info("Uploaded %s → %s", alias, pub_url)
 

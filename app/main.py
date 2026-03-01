@@ -79,6 +79,7 @@ async def create_job(payload: JobCreate):
             output_filename=payload.output_filename,
             webhook_url=payload.webhook_url,
             metadata_=payload.metadata,
+            output_presigned_url=payload.output_presigned_url,
             status=JobStatus.QUEUED,
             stage="QUEUED",
         )
@@ -170,6 +171,7 @@ async def create_command(payload: CommandCreate):
             input_files=payload.input_files,
             output_files_spec=payload.output_files,
             webhook_url=payload.webhook_url,
+            output_presigned_urls=payload.output_presigned_urls,
             status=JobStatus.QUEUED,
             stage="QUEUED",
         )
