@@ -7,7 +7,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Deploy via SSH
@@ -27,12 +27,20 @@ jobs:
             docker compose build api worker
 
             echo "==> Restarting services..."
-            docker compose up -d --force-recreate api worker
+            docker compose up -d --force-recreate --remove-orphans api worker
 
             echo "==> Waiting for startup..."
-            sleep 5
+            sleep 10
 
-            echo "==> Health check..."
-            curl -sf http://localhost:8080/health || exit 1
-
-            echo "✅ Deploy successful!"
+            echo "==> Health check (with retries)..."
+            for i in 1 2 3 4 5; do
+              if curl -sf http://localhost:8080/health > /dev/null; then
+                echo "✅ Deploy successful!"
+                exit 0
+              fi
+              echo "  Attempt $i failed, retrying in 5s..."
+              sleep 5
+            done
+            echo "❌ Health check failed after 5 attempts"
+            docker compose logs --tail=50 api
+            exit 1
