@@ -19,8 +19,14 @@ from app.schemas import (
     CommandCreate, CommandCreated, CommandResponse, OutputFileResult
 )
 from app.security import URLSecurityError, validate_input_url, validate_ffmpeg_command, CommandSecurityError
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from starlette.requests import Request
 
 settings = get_settings()
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
 # ── Async DB setup ────────────────────────────────────────────────────────────
 
@@ -44,6 +50,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,7 +64,8 @@ app.add_middleware(
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/jobs", response_model=JobCreated, status_code=202)
-async def create_job(payload: JobCreate):
+@limiter.limit("20/minute")
+async def create_job(request: Request, payload: JobCreate):
     """Submit a new video processing job."""
     # Validate input URL (SSRF protection)
     try:
@@ -146,7 +155,8 @@ async def health():
 # ── Command routes (Rendi-style raw FFmpeg) ───────────────────────────────────
 
 @app.post("/v1/commands", response_model=CommandCreated, status_code=202)
-async def create_command(payload: CommandCreate):
+@limiter.limit("20/minute")
+async def create_command(request: Request, payload: CommandCreate):
     """Submit a raw FFmpeg command (Rendi-compatible API)."""
     # Validate all input URLs (SSRF protection)
     for alias, url in payload.input_files.items():

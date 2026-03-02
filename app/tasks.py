@@ -63,18 +63,37 @@ def _set_status(db, job: Job, status: JobStatus, stage: str | None = None):
     db.commit()
 
 
+MAX_INPUT_BYTES = 500 * 1024 * 1024  # 500 MB hard limit
+
 def _download_file(url: str, dest_path: str, max_retries: int = 3) -> None:
     validate_input_url(url)
     backoffs = [10, 30, 90]
     import time
     for attempt in range(max_retries):
         try:
-            with httpx.stream("GET", url, follow_redirects=True, timeout=60) as r:
+            with httpx.stream("GET", url, follow_redirects=True,
+                              timeout=httpx.Timeout(connect=15, read=120, write=30, pool=5)) as r:
                 r.raise_for_status()
+                # Reject files that are too large based on Content-Length header
+                content_length = r.headers.get("content-length")
+                if content_length and int(content_length) > MAX_INPUT_BYTES:
+                    raise RuntimeError(
+                        f"Input file too large: {int(content_length) // (1024*1024)} MB "
+                        f"(limit: {MAX_INPUT_BYTES // (1024*1024)} MB)"
+                    )
+                downloaded = 0
                 with open(dest_path, "wb") as f:
                     for chunk in r.iter_bytes(chunk_size=1024 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > MAX_INPUT_BYTES:
+                            raise RuntimeError(
+                                f"Input file exceeds {MAX_INPUT_BYTES // (1024*1024)} MB limit "
+                                f"(stopped at {downloaded // (1024*1024)} MB)"
+                            )
                         f.write(chunk)
             return
+        except RuntimeError:
+            raise  # don't retry size errors
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(backoffs[attempt])
